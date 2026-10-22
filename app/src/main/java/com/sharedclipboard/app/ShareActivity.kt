@@ -18,7 +18,7 @@ class ShareActivity : Activity() {
         if (text.isNullOrEmpty()) {
             Toast.makeText(appContext, "There is no text to send.", Toast.LENGTH_SHORT).show()
         } else if (!store.isPaired()) {
-            Toast.makeText(appContext, "Open Shared Clipboard and pair with the laptop first.", Toast.LENGTH_LONG).show()
+            Toast.makeText(appContext, "Open Lappy Control and pair with the laptop first.", Toast.LENGTH_LONG).show()
         } else {
             Thread {
                 val message = try {
