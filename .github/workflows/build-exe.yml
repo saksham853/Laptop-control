@@ -1,0 +1,20 @@
+name: Build Windows exe
+
+on: {workflow_dispatch: {}, push: {paths: ["shared_clipboard_secure.py", "app.ico", ".github/workflows/build-exe.yml"]}}
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install packages
+        run: pip install pyinstaller flask "qrcode[pil]" pywebview pystray pynput pyperclip cryptography
+      - name: Build exe
+        run: pyinstaller --clean --onefile --noconsole --name LappyControl --icon app.ico --hidden-import pystray._win32 --hidden-import pynput.keyboard._win32 --hidden-import pynput.mouse._win32 shared_clipboard_secure.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LappyControl-exe
+          path: dist/LappyControl.exe
