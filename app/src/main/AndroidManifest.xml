@@ -27,7 +27,7 @@
             android:name=".ShareActivity"
             android:exported="true"
             android:excludeFromRecents="true"
-            android:label="Shared Clipboard"
+            android:label="Lappy Control"
             android:theme="@android:style/Theme.Translucent.NoTitleBar">
             <intent-filter>
                 <action android:name="android.intent.action.SEND" />
