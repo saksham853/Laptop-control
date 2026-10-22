@@ -1,5 +1,6 @@
 import base64
 import datetime
+import functools
 import hashlib
 import hmac
 import io
@@ -7,9 +8,11 @@ import ipaddress
 import json
 import logging
 import os
+import re
 import secrets
 import socket
 import ssl
+import subprocess
 import sys
 import threading
 import time
@@ -197,7 +200,9 @@ PAGE = """
   .check { display: flex; align-items: center; gap: 10px; margin: 8px 0; font-size: 15px; }
   .check input { width: 20px; height: 20px; }
   .tabs { display: flex; gap: 6px; margin-bottom: 12px; }
-  .tabs button { min-width: 0; padding: 11px 2px; font-size: 14px; }
+  .tabs button { min-width: 0; padding: 11px 1px; font-size: 13px; }
+  .pick { flex: 1; background: var(--bg); color: var(--text); border: 1px solid var(--line);
+          border-radius: 8px; padding: 8px; font-size: 14px; }
   .tabs button.active { background: var(--accent); color: white; }
   .grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 8px; }
   .grid4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-top: 8px; }
@@ -250,6 +255,7 @@ PAGE = """
       <button id="btn-media" onclick="showTab('media')">Media</button>
       <button id="btn-mouse" onclick="showTab('mouse')">Mouse</button>
       <button id="btn-keys" onclick="showTab('keys')">Keyboard</button>
+      <button id="btn-system" onclick="showTab('system')">System</button>
     </div>
 
     <div class="card" id="tab-clip">
@@ -309,6 +315,67 @@ PAGE = """
           <option value="tabs">Switch browser tabs</option>
         </select>
       </label>
+    </div>
+
+    <div class="card phone-only" id="tab-system" style="display:none">
+      <div class="row" style="margin-top:0"><button onclick="loadSystem()">Refresh</button></div>
+      <p class="hint">Remote control must be switched on for this tab.</p>
+
+      <div class="title">Battery and power</div>
+      <p class="hint" id="sysBattery">Loading...</p>
+      <label class="check">Energy saver
+        <select id="saver" class="pick">
+          <option value="off">Off</option>
+          <option value="20">Turns on at 20%</option>
+          <option value="always">On whenever on battery</option>
+        </select>
+      </label>
+      <label class="check">Power mode
+        <select id="powerMode" class="pick">
+          <option value="efficiency">Best power efficiency</option>
+          <option value="balanced">Balanced</option>
+          <option value="performance">Best performance</option>
+        </select>
+      </label>
+
+      <div class="title">Volume</div>
+      <label class="check"><input type="range" id="volRange" min="0" max="100" value="0" style="flex:1; width:auto"><span id="volText">...</span></label>
+      <div class="row"><button id="muteBtn">Mute</button></div>
+
+      <div class="title">Projection</div>
+      <div class="grid4">
+        <button onclick="project('internal')">PC screen only</button>
+        <button onclick="project('clone')">Duplicate</button>
+        <button onclick="project('extend')">Extend</button>
+        <button onclick="projectOnly(this)">Second screen only</button>
+      </div>
+
+      <div class="title">Wi-Fi</div>
+      <p class="hint" id="wifiNow">Loading...</p>
+      <div id="wifiList"></div>
+      <p class="hint">Switching to another network can disconnect this phone from the laptop, unless the phone joins the same network.</p>
+
+      <div class="title">Bluetooth</div>
+      <p class="hint" id="btState">Loading...</p>
+      <div class="row">
+        <button onclick="setBluetooth('On')">Turn on</button>
+        <button onclick="bluetoothOff(this)">Turn off</button>
+      </div>
+      <div id="btList"></div>
+      <p class="hint bad" id="btAdmin"></p>
+      <div class="row">
+        <button onclick="scanBluetooth()">Scan nearby</button>
+        <button onclick="pairBluetooth()">Pair new device</button>
+      </div>
+      <div id="btFound"></div>
+      <p class="hint">Pairing opens the Bluetooth page on the laptop. Finish it with the Mouse tab.</p>
+
+      <div class="title">Mobile hotspot</div>
+      <p class="hint" id="hotspotInfo">Loading...</p>
+      <div class="row">
+        <button onclick="hotspotStart(this)">Start hotspot</button>
+        <button onclick="setHotspot('Off')">Stop hotspot</button>
+      </div>
     </div>
 
     <div class="card phone-only" id="tab-keys" style="display:none">
@@ -529,12 +596,13 @@ async function lockLaptop(button) {
   await post("/lock", {});
 }
 
-const TABS = ["clip", "media", "mouse", "keys"];
+const TABS = ["clip", "media", "mouse", "keys", "system"];
 function showTab(name) {
   TABS.forEach((t) => {
     document.getElementById("tab-" + t).style.display = t === name ? "block" : "none";
     document.getElementById("btn-" + t).className = t === name ? "active" : "";
   });
+  if (name === "system") loadSystem();
 }
 
 // ---- Touchpad
@@ -711,6 +779,184 @@ function caretToEnd() {
 }
 kbd.addEventListener("focus", () => setTimeout(caretToEnd, 0));
 kbd.addEventListener("click", () => setTimeout(caretToEnd, 0));
+
+// ---- System tab
+const sysBattery = document.getElementById("sysBattery");
+const saverSel = document.getElementById("saver");
+const powerSel = document.getElementById("powerMode");
+const volRange = document.getElementById("volRange");
+const volText = document.getElementById("volText");
+const muteBtn = document.getElementById("muteBtn");
+const wifiNow = document.getElementById("wifiNow");
+const wifiList = document.getElementById("wifiList");
+const btState = document.getElementById("btState");
+const btList = document.getElementById("btList");
+const btAdmin = document.getElementById("btAdmin");
+const btFound = document.getElementById("btFound");
+const hotspotInfo = document.getElementById("hotspotInfo");
+
+function el(tag, text, cls) {
+  const e = document.createElement(tag);
+  if (text !== undefined) e.textContent = text;
+  if (cls) e.className = cls;
+  return e;
+}
+async function getJson(path) {
+  try {
+    const reply = await fetch(path);
+    const data = await reply.json();
+    if (!reply.ok) { notice(data.error || "Request failed"); return null; }
+    return data;
+  } catch (e) {
+    notice("Cannot reach the laptop.");
+    return null;
+  }
+}
+async function postJson(path, body) {
+  const reply = await post(path, body);
+  if (!reply || !reply.ok) return null;
+  try { return await reply.json(); } catch (e) { return null; }
+}
+function line(label, button) {          // a line of text with a button on the right
+  const row = el("div", undefined, "device");
+  row.appendChild(el("span", label));
+  if (button) row.appendChild(button);
+  return row;
+}
+function tapButton(text, key, handler, needConfirm) {
+  const button = el("button", text);
+  button.onclick = async () => {
+    if (needConfirm && !armed(key, button, text)) return;
+    button.textContent = text;
+    await handler();
+  };
+  return button;
+}
+
+function loadSystem() {
+  loadBattery(); loadPower(); loadVolume(); loadWifi(); loadBluetooth(); loadHotspot();
+}
+
+async function loadBattery() {
+  const d = await getJson("/system/battery");
+  if (!d) return;
+  sysBattery.textContent = d.has_battery
+    ? "Battery " + d.percent + "%, " + (d.plugged ? "plugged in" : "on battery") + (d.saver ? ", energy saver is on" : "")
+    : "No battery found.";
+  if (document.activeElement !== saverSel && d.saver_mode !== "custom") saverSel.value = d.saver_mode;
+}
+async function loadPower() {
+  const d = await getJson("/system/power");
+  if (d && document.activeElement !== powerSel) powerSel.value = d.mode;
+}
+saverSel.addEventListener("change", async () => {
+  await postJson("/system/saver", { mode: saverSel.value });
+  loadBattery();
+});
+powerSel.addEventListener("change", () => postJson("/system/power", { mode: powerSel.value }));
+
+function showVolume(d) {
+  volRange.value = d.level;
+  volText.textContent = d.level + "%" + (d.muted ? " muted" : "");
+  muteBtn.textContent = d.muted ? "Unmute" : "Mute";
+}
+async function loadVolume() {
+  const d = await getJson("/system/volume");
+  if (d) showVolume(d);
+}
+volRange.addEventListener("input", () => { volText.textContent = volRange.value + "%"; });
+volRange.addEventListener("change", async () => {
+  const d = await postJson("/system/volume", { level: parseInt(volRange.value, 10) });
+  if (d) showVolume(d);
+});
+muteBtn.onclick = async () => {
+  const d = await postJson("/system/volume", { mute: "toggle" });
+  if (d) showVolume(d);
+};
+
+function project(mode) { return postJson("/system/project", { mode: mode }); }
+function projectOnly(button) {
+  if (!armed("second", button, "Second screen only")) return;
+  button.textContent = "Second screen only";
+  project("external");
+}
+
+async function loadWifi() {
+  const d = await getJson("/system/wifi");
+  if (!d) return;
+  const current = d.current.ssid || "";
+  wifiNow.textContent = current
+    ? "Connected to " + current + (d.current.signal ? " (signal " + d.current.signal + ")" : "")
+    : "Not connected to a Wi-Fi network.";
+  wifiList.textContent = "";
+  d.saved.forEach((n) => {
+    if (n.name === current) { wifiList.appendChild(line(n.name + " (current)")); return; }
+    const label = n.name + (n.in_range ? "" : " (not in range)");
+    const button = tapButton("Switch", "wifi-" + n.name, async () => {
+      notice("Switching to " + n.name + "...");
+      await postJson("/system/wifi", { name: n.name });
+      setTimeout(loadWifi, 5000);
+    }, true);
+    wifiList.appendChild(line(label, button));
+  });
+  if (!d.saved.length) wifiList.textContent = "No saved networks.";
+}
+
+async function loadBluetooth() {
+  const d = await getJson("/system/bluetooth");
+  if (!d) return;
+  const words = { On: "on", Off: "off", none: "not found on this laptop" };
+  btState.textContent = "Bluetooth is " + (words[d.radio] || "in an unknown state") + ".";
+  btList.textContent = "";
+  d.devices.forEach((dev) => {
+    const status = dev.disabled ? "disconnected" : (dev.connected ? "connected" : "paired");
+    const action = dev.disabled ? "connect" : "disconnect";
+    const button = tapButton(dev.disabled ? "Connect" : "Disconnect", "bt-" + dev.id, async () => {
+      await postJson("/system/bluetooth", { action: action, id: dev.id });
+      loadBluetooth();
+    }, !dev.disabled);
+    btList.appendChild(line(dev.name + " (" + status + ")", button));
+  });
+  if (!d.devices.length) btList.textContent = "No paired devices found.";
+  btAdmin.textContent = d.admin ? "" : "Connect and Disconnect need Lappy Control to run as administrator.";
+}
+async function setBluetooth(state) {
+  await postJson("/system/bluetooth", { state: state });
+  loadBluetooth();
+}
+function bluetoothOff(button) {
+  if (!armed("btoff", button, "Turn off")) return;
+  button.textContent = "Turn off";
+  setBluetooth("Off");
+}
+async function scanBluetooth() {
+  btFound.textContent = "Scanning, this takes about 15 seconds...";
+  const d = await getJson("/system/bluetooth/scan");
+  btFound.textContent = "";
+  if (!d) return;
+  if (!d.found.length) btFound.textContent = "No new devices found. Put the device in pairing mode and scan again.";
+  d.found.forEach((name) => btFound.appendChild(line(name)));
+}
+function pairBluetooth() { return postJson("/system/bluetooth", { action: "settings" }); }
+
+function showHotspot(d) {
+  hotspotInfo.textContent = "Hotspot is " + d.state.toLowerCase()
+    + (d.ssid ? ". Name: " + d.ssid : "") + (d.password ? ". Password: " + d.password : "") + ".";
+}
+async function loadHotspot() {
+  const d = await getJson("/system/hotspot");
+  if (d) showHotspot(d);
+}
+async function setHotspot(state) {
+  hotspotInfo.textContent = "Please wait...";
+  const d = await postJson("/system/hotspot", { state: state });
+  if (d) showHotspot(d); else loadHotspot();
+}
+function hotspotStart(button) {
+  if (!armed("hotspot", button, "Start hotspot")) return;
+  button.textContent = "Start hotspot";
+  setHotspot("On");
+}
 
 // ---- Switches
 remoteBox.addEventListener("change", async () => {
@@ -1188,6 +1434,508 @@ def eject_route():
         cfg["pin"] = new_pin()  # the ejected device cannot sign in again with the old PIN
         save_config()
     return jsonify(ok=True)
+
+
+# ------------------------------------------------------------ system controls
+# Battery, power, volume, projection, Wi-Fi, Bluetooth and hotspot. These work on Windows only.
+# Functions that Python cannot reach directly use PowerShell, which is part of Windows.
+
+
+class ActionFailed(Exception):
+    """Something Windows could not do. The message is shown on the phone."""
+
+    def __init__(self, message, status=500):
+        super().__init__(message)
+        self.status = status
+
+
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+# Lets PowerShell wait for Windows Runtime (WinRT) calls.
+PS_ASYNC = r"""
+Add-Type -AssemblyName System.Runtime.WindowsRuntime
+$asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]
+function Await($WinRtTask, $ResultType) {
+    $asTask = $asTaskGeneric.MakeGenericMethod($ResultType)
+    $netTask = $asTask.Invoke($null, @($WinRtTask))
+    $netTask.Wait(-1) | Out-Null
+    $netTask.Result
+}
+"""
+
+# Reads the Bluetooth radio, or switches it when __SET__ is On or Off.
+RADIO_PS = r"""
+$null = [Windows.Devices.Radios.Radio,Windows.System.Devices,ContentType=WindowsRuntime]
+$null = [Windows.Devices.Radios.RadioAccessStatus,Windows.System.Devices,ContentType=WindowsRuntime]
+$null = [Windows.Devices.Radios.RadioState,Windows.System.Devices,ContentType=WindowsRuntime]
+$null = Await ([Windows.Devices.Radios.Radio]::RequestAccessAsync()) ([Windows.Devices.Radios.RadioAccessStatus])
+$radios = Await ([Windows.Devices.Radios.Radio]::GetRadiosAsync()) ([System.Collections.Generic.IReadOnlyList[Windows.Devices.Radios.Radio]])
+$bt = $radios | Where-Object { $_.Kind -eq 'Bluetooth' } | Select-Object -First 1
+if (-not $bt) {
+    $state = 'none'
+} else {
+    $want = '__SET__'
+    if ($want) {
+        $null = Await ($bt.SetStateAsync([Windows.Devices.Radios.RadioState]$want)) ([Windows.Devices.Radios.RadioAccessStatus])
+    }
+    $state = [string]$bt.State
+}
+"""
+
+BT_STATUS_PS = PS_ASYNC + r"""
+$state = 'unknown'
+try {
+""" + RADIO_PS.replace("__SET__", "") + r"""
+} catch {
+    $state = 'unknown'
+}
+$out = @()
+$found = @(Get-PnpDevice -Class Bluetooth -ErrorAction SilentlyContinue | Where-Object {
+    $_.FriendlyName -and ($_.InstanceId -like 'BTHENUM\DEV_*' -or $_.InstanceId -like 'BTHLE\DEV_*')
+})
+foreach ($d in $found) {
+    $connected = $false
+    try {
+        $connected = [bool](Get-PnpDeviceProperty -InstanceId $d.InstanceId -KeyName '{83DA6326-97A6-4088-9453-A1923F573B29} 15' -ErrorAction Stop).Data
+    } catch {}
+    $out += [pscustomobject]@{
+        name = [string]$d.FriendlyName
+        id = [string]$d.InstanceId
+        connected = $connected
+        disabled = ([string]$d.Problem -eq 'CM_PROB_DISABLED')
+    }
+}
+ConvertTo-Json -Compress -Depth 4 -InputObject @{ radio = $state; devices = $out }
+"""
+
+BT_SET_PS = PS_ASYNC + RADIO_PS + r"""
+Write-Output $state
+"""
+
+BT_SCAN_PS = PS_ASYNC + r"""
+$null = [Windows.Devices.Bluetooth.BluetoothDevice,Windows.Devices.Bluetooth,ContentType=WindowsRuntime]
+$null = [Windows.Devices.Enumeration.DeviceInformation,Windows.Devices.Enumeration,ContentType=WindowsRuntime]
+$null = [Windows.Devices.Enumeration.DeviceInformationCollection,Windows.Devices.Enumeration,ContentType=WindowsRuntime]
+$selector = [Windows.Devices.Bluetooth.BluetoothDevice]::GetDeviceSelectorFromPairingState($false)
+$found = Await ([Windows.Devices.Enumeration.DeviceInformation]::FindAllAsync($selector)) ([Windows.Devices.Enumeration.DeviceInformationCollection])
+$names = @($found | Where-Object { $_.Name } | ForEach-Object { [string]$_.Name })
+ConvertTo-Json -Compress -InputObject $names
+"""
+
+HOTSPOT_PS = PS_ASYNC + r"""
+$null = [Windows.Networking.Connectivity.NetworkInformation,Windows.Networking.Connectivity,ContentType=WindowsRuntime]
+$null = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager,Windows.Networking.NetworkOperators,ContentType=WindowsRuntime]
+$null = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringOperationResult,Windows.Networking.NetworkOperators,ContentType=WindowsRuntime]
+$conn = [Windows.Networking.Connectivity.NetworkInformation]::GetInternetConnectionProfile()
+if (-not $conn) { throw 'There is no internet connection to share.' }
+$manager = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager]::CreateFromConnectionProfile($conn)
+$want = '__SET__'
+if ($want -eq 'On' -and [string]$manager.TetheringOperationalState -ne 'On') {
+    $r = Await ($manager.StartTetheringAsync()) ([Windows.Networking.NetworkOperators.NetworkOperatorTetheringOperationResult])
+    if ([string]$r.Status -ne 'Success') { throw ('The hotspot did not start: ' + [string]$r.Status) }
+} elseif ($want -eq 'Off' -and [string]$manager.TetheringOperationalState -ne 'Off') {
+    $r = Await ($manager.StopTetheringAsync()) ([Windows.Networking.NetworkOperators.NetworkOperatorTetheringOperationResult])
+    if ([string]$r.Status -ne 'Success') { throw ('The hotspot did not stop: ' + [string]$r.Status) }
+}
+$config = $manager.GetCurrentAccessPointConfiguration()
+ConvertTo-Json -Compress -InputObject @{ state = [string]$manager.TetheringOperationalState; ssid = [string]$config.Ssid; password = [string]$config.Passphrase }
+"""
+
+VOLUME_PS = r"""
+Add-Type -TypeDefinition @'
+using System.Runtime.InteropServices;
+[Guid("5CDF2C82-841E-4546-9722-0CF74078229A"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IAudioEndpointVolume {
+  int f1(); int f2(); int f3(); int f4();
+  int SetMasterVolumeLevelScalar(float fLevel, System.Guid pguidEventContext);
+  int f5();
+  int GetMasterVolumeLevelScalar(out float pfLevel);
+  int f6(); int f7(); int f8(); int f9();
+  int SetMute([MarshalAs(UnmanagedType.Bool)] bool bMute, System.Guid pguidEventContext);
+  int GetMute(out bool pbMute);
+}
+[Guid("D666063F-1587-4E43-81F1-B948E807363F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IMMDevice {
+  int Activate(ref System.Guid id, int clsCtx, int activationParams, out IAudioEndpointVolume aev);
+}
+[Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IMMDeviceEnumerator {
+  int f();
+  int GetDefaultAudioEndpoint(int dataFlow, int role, out IMMDevice endpoint);
+}
+[ComImport, Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")] class MMDeviceEnumeratorComObject { }
+public class Audio {
+  static IAudioEndpointVolume Vol() {
+    var enumerator = new MMDeviceEnumeratorComObject() as IMMDeviceEnumerator;
+    IMMDevice dev = null;
+    Marshal.ThrowExceptionForHR(enumerator.GetDefaultAudioEndpoint(0, 1, out dev));
+    IAudioEndpointVolume epv = null;
+    var epvid = typeof(IAudioEndpointVolume).GUID;
+    Marshal.ThrowExceptionForHR(dev.Activate(ref epvid, 23, 0, out epv));
+    return epv;
+  }
+  public static float Volume {
+    get { float v = -1; Marshal.ThrowExceptionForHR(Vol().GetMasterVolumeLevelScalar(out v)); return v; }
+    set { Marshal.ThrowExceptionForHR(Vol().SetMasterVolumeLevelScalar(value, System.Guid.Empty)); }
+  }
+  public static bool Mute {
+    get { bool mute; Marshal.ThrowExceptionForHR(Vol().GetMute(out mute)); return mute; }
+    set { Marshal.ThrowExceptionForHR(Vol().SetMute(value, System.Guid.Empty)); }
+  }
+}
+'@
+__COMMAND__
+$ci = [System.Globalization.CultureInfo]::InvariantCulture
+Write-Output ([string]::Format($ci, '{0}|{1}', [Audio]::Volume, [Audio]::Mute))
+"""
+
+BT_ID = re.compile(r"^(BTHENUM|BTHLE)\\DEV_[0-9A-Za-z&_.\\-]+$")
+POWER_MODES = {"efficiency": "OVERLAY_SCHEME_MIN", "balanced": "OVERLAY_SCHEME_NONE",
+               "performance": "OVERLAY_SCHEME_MAX"}
+POWER_GUIDS = {
+    "961cc777-2547-4f9d-8174-7d86181b8a7a": "efficiency",
+    "00000000-0000-0000-0000-000000000000": "balanced",
+    "3af9b8d9-7c97-431d-ad78-34a8bfea439f": "performance",
+    "ded574b5-45a0-4f42-8737-46345c09c238": "performance",
+}
+PROJECT_MODES = {"internal": "/internal", "clone": "/clone", "extend": "/extend", "external": "/external"}
+
+
+def is_admin():
+    try:
+        import ctypes
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def oem_encoding():
+    try:
+        import ctypes
+        return "cp%d" % ctypes.windll.kernel32.GetOEMCP()
+    except Exception:
+        return "utf-8"
+
+
+def run_ps(script, timeout=25):
+    """Runs a PowerShell script (Windows PowerShell 5.1) and returns its text output."""
+    script = "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8\n$ErrorActionPreference = 'Stop'\n" + script
+    encoded = base64.b64encode(script.encode("utf-16-le")).decode()
+    try:
+        done = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+             "-EncodedCommand", encoded],
+            capture_output=True, timeout=timeout, creationflags=NO_WINDOW)
+    except subprocess.TimeoutExpired:
+        raise ActionFailed("Windows took too long to answer.")
+    except OSError:
+        raise ActionFailed("PowerShell is not available on this computer.")
+    if done.returncode != 0:
+        error = done.stderr.decode("utf-8", errors="replace")
+        line = next((x.strip() for x in error.splitlines() if x.strip()), "")
+        raise ActionFailed(line[:160] or "Windows refused the request.")
+    return done.stdout.decode("utf-8", errors="replace").strip()
+
+
+def run_exe(args, timeout=15):
+    try:
+        done = subprocess.run(args, capture_output=True, timeout=timeout, creationflags=NO_WINDOW)
+    except (OSError, subprocess.TimeoutExpired):
+        raise ActionFailed("Windows did not answer.")
+    return done.returncode, done.stdout.decode(oem_encoding(), errors="replace")
+
+
+def read_json(text):
+    try:
+        return json.loads(text)
+    except ValueError:
+        raise ActionFailed("Windows gave an answer that could not be read.")
+
+
+# ---- battery and power
+
+def battery_status():
+    import ctypes
+
+    class PowerStatus(ctypes.Structure):
+        _fields_ = [("ac", ctypes.c_ubyte), ("flag", ctypes.c_ubyte), ("percent", ctypes.c_ubyte),
+                    ("system", ctypes.c_ubyte), ("life", ctypes.c_ulong), ("full", ctypes.c_ulong)]
+
+    status = PowerStatus()
+    if not ctypes.windll.kernel32.GetSystemPowerStatus(ctypes.byref(status)):
+        raise ActionFailed("Could not read the battery.")
+    has_battery = status.flag != 128 and status.percent != 255
+    return {"has_battery": has_battery, "percent": int(status.percent) if has_battery else None,
+            "plugged": status.ac == 1, "saver": bool(status.system & 1)}
+
+
+def saver_threshold():
+    code, text = run_exe(["powercfg", "/query", "SCHEME_CURRENT", "SUB_ENERGYSAVER", "ESBATTTHRESHOLD"])
+    values = re.findall(r"0x[0-9a-fA-F]{8}", text)
+    if code != 0 or not values:
+        return 0
+    return int(values[-1], 16)  # the last value is the one used on battery
+
+
+def saver_mode():
+    level = saver_threshold()
+    return {0: "off", 20: "20", 100: "always"}.get(level, "off" if level == 0 else "custom")
+
+
+def set_saver(level):
+    code, _ = run_exe(["powercfg", "/setdcvalueindex", "SCHEME_CURRENT", "SUB_ENERGYSAVER",
+                       "ESBATTTHRESHOLD", str(level)])
+    if code != 0:
+        raise ActionFailed("Windows did not accept the energy saver setting.")
+    run_exe(["powercfg", "/setactive", "SCHEME_CURRENT"])
+
+
+def power_mode_now(plugged):
+    import winreg
+    path = r"SYSTEM\CurrentControlSet\Control\Power\User\PowerSchemes"
+    name = "ActiveOverlayAcPowerScheme" if plugged else "ActiveOverlayDcPowerScheme"
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, path) as key:
+            value = str(winreg.QueryValueEx(key, name)[0]).strip("{}").lower()
+    except OSError:
+        return "balanced"
+    return POWER_GUIDS.get(value, "balanced")
+
+
+def set_power_mode(mode):
+    code, _ = run_exe(["powercfg", "/overlaysetactive", POWER_MODES[mode]])
+    if code != 0:
+        raise ActionFailed("This Windows version has no power mode switch.")
+
+
+# ---- volume
+
+def volume_read(command=""):
+    out = run_ps(VOLUME_PS.replace("__COMMAND__", command), timeout=25)
+    level, _, muted = out.partition("|")
+    try:
+        return {"level": int(round(float(level.replace(",", ".")) * 100)), "muted": muted.strip().lower() == "true"}
+    except ValueError:
+        raise ActionFailed("Could not read the volume.")
+
+
+# ---- projection
+
+def project(mode):
+    exe = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "DisplaySwitch.exe")
+    try:
+        subprocess.Popen([exe, PROJECT_MODES[mode]], creationflags=NO_WINDOW)
+    except OSError:
+        raise ActionFailed("Could not change the projection.")
+
+
+# ---- Wi-Fi: switch between saved networks
+
+def wifi_saved():
+    code, text = run_exe(["netsh", "wlan", "show", "profiles"])
+    names = []
+    for line in text.splitlines():
+        found = re.match(r"^\s+[^:]+?\s*:\s*(.+)$", line)   # lines such as "    All User Profile : Name"
+        if found and not found.group(1).startswith("<"):
+            names.append(found.group(1).strip())
+    return names
+
+
+def wifi_status():
+    code, text = run_exe(["netsh", "wlan", "show", "interfaces"])
+    current = {}
+    for line in text.splitlines():
+        key, sep, value = line.partition(":")
+        if sep and key.strip() == "SSID":
+            current["ssid"] = value.strip()
+        elif sep and key.strip() == "Signal":
+            current["signal"] = value.strip()
+    code, text = run_exe(["netsh", "wlan", "show", "networks"])
+    visible = {m.group(1).strip() for m in re.finditer(r"^SSID\s+\d+\s*:\s*(.*)$", text, re.M)}
+    saved = [{"name": n, "in_range": n in visible} for n in wifi_saved()]
+    return {"current": current, "saved": saved}
+
+
+def wifi_connect(name):
+    if name not in wifi_saved() or '"' in name:
+        raise ActionFailed("That network is not saved on this laptop.", 400)
+    try:
+        done = subprocess.run('netsh wlan connect name="%s"' % name, capture_output=True, timeout=20,
+                              creationflags=NO_WINDOW)
+    except (OSError, subprocess.TimeoutExpired):
+        raise ActionFailed("Windows did not answer.")
+    if done.returncode != 0:
+        raise ActionFailed("Windows could not connect to that network.")
+
+
+# ---- Bluetooth
+
+def bluetooth_status():
+    data = read_json(run_ps(BT_STATUS_PS, timeout=30))
+    devices, seen = [], set()
+    for d in data.get("devices") or []:
+        if d["name"] not in seen:
+            seen.add(d["name"])
+            devices.append(d)
+    return {"radio": data.get("radio", "unknown"), "devices": devices, "admin": is_admin()}
+
+
+def bluetooth_radio(state):
+    return run_ps(BT_SET_PS.replace("__SET__", state), timeout=30)
+
+
+def bluetooth_device(action, device_id):
+    if not BT_ID.match(device_id):
+        raise ActionFailed("Unknown device.", 400)
+    if not is_admin():
+        raise ActionFailed("Connect and Disconnect need Lappy Control to run as administrator.", 403)
+    command = "Disable-PnpDevice" if action == "disconnect" else "Enable-PnpDevice"
+    run_ps("%s -InstanceId '%s' -Confirm:$false" % (command, device_id), timeout=30)
+
+
+def bluetooth_scan():
+    found = read_json(run_ps(BT_SCAN_PS, timeout=45))
+    return sorted(set(found if isinstance(found, list) else [found]))
+
+
+# ---- hotspot
+
+def hotspot(state=""):
+    return read_json(run_ps(HOTSPOT_PS.replace("__SET__", state), timeout=40))
+
+
+# ---- routes
+
+def gated(handler):
+    """Remote control must be on. Errors become a message for the phone."""
+    @functools.wraps(handler)
+    def wrapper():
+        blocked = remote_gate()
+        if blocked:
+            return blocked
+        try:
+            return jsonify(handler(request.get_json(silent=True) or {}))
+        except ActionFailed as error:
+            return jsonify(error=str(error)), error.status
+        except Exception:
+            return jsonify(error="That did not work on this laptop."), 500
+    return wrapper
+
+
+@app.route("/system/battery")
+@gated
+def system_battery(data):
+    info = battery_status()
+    info["saver_mode"] = saver_mode()
+    return info
+
+
+@app.route("/system/saver", methods=["POST"])
+@gated
+def system_saver(data):
+    levels = {"off": 0, "20": 20, "always": 100}
+    if data.get("mode") not in levels:
+        raise ActionFailed("Unknown energy saver choice.", 400)
+    set_saver(levels[data["mode"]])
+    return {"ok": True}
+
+
+@app.route("/system/power")
+@gated
+def system_power(data):
+    return {"mode": power_mode_now(battery_status()["plugged"])}
+
+
+@app.route("/system/power", methods=["POST"])
+@gated
+def system_power_set(data):
+    if data.get("mode") not in POWER_MODES:
+        raise ActionFailed("Unknown power mode.", 400)
+    set_power_mode(data["mode"])
+    return {"ok": True, "mode": data["mode"]}
+
+
+@app.route("/system/volume")
+@gated
+def system_volume(data):
+    return volume_read()
+
+
+@app.route("/system/volume", methods=["POST"])
+@gated
+def system_volume_set(data):
+    if "level" in data:
+        try:
+            level = max(0, min(100, int(data["level"])))
+        except (TypeError, ValueError):
+            raise ActionFailed("Bad volume.", 400)
+        return volume_read("[Audio]::Volume = %.2f" % (level / 100.0))
+    if data.get("mute") == "toggle":
+        return volume_read("[Audio]::Mute = -not [Audio]::Mute")
+    raise ActionFailed("Unknown volume action.", 400)
+
+
+@app.route("/system/project", methods=["POST"])
+@gated
+def system_project(data):
+    if data.get("mode") not in PROJECT_MODES:
+        raise ActionFailed("Unknown projection.", 400)
+    project(data["mode"])
+    return {"ok": True}
+
+
+@app.route("/system/wifi")
+@gated
+def system_wifi(data):
+    return wifi_status()
+
+
+@app.route("/system/wifi", methods=["POST"])
+@gated
+def system_wifi_set(data):
+    wifi_connect(str(data.get("name", "")))
+    return {"ok": True}
+
+
+@app.route("/system/bluetooth")
+@gated
+def system_bluetooth(data):
+    return bluetooth_status()
+
+
+@app.route("/system/bluetooth", methods=["POST"])
+@gated
+def system_bluetooth_set(data):
+    if data.get("state") in ("On", "Off"):
+        return {"radio": bluetooth_radio(data["state"])}
+    if data.get("action") in ("connect", "disconnect"):
+        bluetooth_device(data["action"], str(data.get("id", "")))
+        return {"ok": True}
+    if data.get("action") == "settings":
+        os.startfile("ms-settings:bluetooth")  # the laptop shows the pairing screen
+        return {"ok": True}
+    raise ActionFailed("Unknown Bluetooth action.", 400)
+
+
+@app.route("/system/bluetooth/scan")
+@gated
+def system_bluetooth_scan(data):
+    return {"found": bluetooth_scan()}
+
+
+@app.route("/system/hotspot")
+@gated
+def system_hotspot(data):
+    return hotspot()
+
+
+@app.route("/system/hotspot", methods=["POST"])
+@gated
+def system_hotspot_set(data):
+    if data.get("state") not in ("On", "Off"):
+        raise ActionFailed("Unknown hotspot action.", 400)
+    return hotspot(data["state"])
+
 
 
 # --------------------------------------------------------- background jobs
