@@ -118,7 +118,7 @@ class MainActivity : AppCompatActivity() {
         val pin = uri.getQueryParameter("pin")
         val fingerprint = uri.getQueryParameter("fp")
         if (uri.scheme != "sharedclip" || host == null || port == null || pin == null || fingerprint == null) {
-            status.text = "This is not a Shared Clipboard code."
+            status.text = "This is not a Lappy Control code."
             return
         }
         store.savePairing(host, port, pin, fingerprint.lowercase())
